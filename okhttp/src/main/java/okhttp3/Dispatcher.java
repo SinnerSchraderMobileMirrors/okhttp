@@ -38,6 +38,7 @@ import okhttp3.internal.Util;
 public final class Dispatcher {
   private int maxRequests = 64;
   private int maxRequestsPerHost = 5;
+  private Runnable idleCallback;
 
   /** Executes calls. Created lazily. */
   private ExecutorService executorService;
@@ -106,6 +107,13 @@ public final class Dispatcher {
     return maxRequestsPerHost;
   }
 
+  /**
+   * Set a callback to be invoked when the number of
+   */
+  public synchronized void setIdleCallback(Runnable idleCallback) {
+    this.idleCallback = idleCallback;
+  }
+
   synchronized void enqueue(AsyncCall call) {
     if (runningAsyncCalls.size() < maxRequests && runningCallsForHost(call) < maxRequestsPerHost) {
       runningAsyncCalls.add(call);
@@ -137,6 +145,10 @@ public final class Dispatcher {
   synchronized void finished(AsyncCall call) {
     if (!runningAsyncCalls.remove(call)) throw new AssertionError("AsyncCall wasn't running!");
     promoteCalls();
+
+    if (runningCallsCount() == 0 && idleCallback != null) {
+      idleCallback.run();
+    }
   }
 
   private void promoteCalls() {
@@ -173,6 +185,10 @@ public final class Dispatcher {
   /** Used by {@code Call#execute} to signal completion. */
   synchronized void finished(Call call) {
     if (!runningSyncCalls.remove(call)) throw new AssertionError("Call wasn't in-flight!");
+
+    if (runningCallsCount() == 0 && idleCallback != null) {
+      idleCallback.run();
+    }
   }
 
   /** Returns a snapshot of the calls currently awaiting execution. */

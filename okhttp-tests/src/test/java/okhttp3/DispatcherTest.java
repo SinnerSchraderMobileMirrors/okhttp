@@ -11,10 +11,12 @@ import java.util.Set;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import okhttp3.RealCall.AsyncCall;
 import org.junit.Before;
 import org.junit.Test;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -211,6 +213,38 @@ public final class DispatcherTest {
 
     assertFalse(a4.isExecuted());
     assertFalse(a4.isCanceled());
+  }
+
+  @Test public void idleCallbackInvokedWhenIdle() throws InterruptedException {
+    final AtomicBoolean idle = new AtomicBoolean();
+    dispatcher.setIdleCallback(new Runnable() {
+      @Override public void run() {
+        idle.set(true);
+      }
+    });
+
+    client.newCall(newRequest("http://a/1")).enqueue(callback);
+    client.newCall(newRequest("http://a/2")).enqueue(callback);
+    executor.finishJob("http://a/1");
+    assertFalse(idle.get());
+
+    final CountDownLatch ready = new CountDownLatch(1);
+    client = client.newBuilder()
+        .addInterceptor(new Interceptor() {
+          @Override public Response intercept(Chain chain) throws IOException {
+            ready.countDown();
+            return chain.proceed(chain.request());
+          }
+        })
+        .build();
+
+    Thread t1 = makeSynchronousCall(client.newCall(newRequest("http://a/3")));
+    ready.await(5, SECONDS);
+    executor.finishJob("http://a/2");
+    assertFalse(idle.get());
+
+    t1.join();
+    assertTrue(idle.get());
   }
 
   private <T> Set<T> set(T... values) {
