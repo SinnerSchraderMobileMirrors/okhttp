@@ -29,6 +29,8 @@ import okio.ByteString;
 import okio.Okio;
 import okio.Source;
 
+import static okhttp3.internal.Util.equal;
+
 /**
  * Read and write HPACK v10.
  *
@@ -152,7 +154,6 @@ final class Hpack {
     }
 
     private void clearDynamicTable() {
-      headerList.clear();
       Arrays.fill(dynamicTable, null);
       nextHeaderIndex = dynamicTable.length - 1;
       headerCount = 0;
@@ -463,29 +464,38 @@ final class Hpack {
         smallestHeaderTableSizeSetting = Integer.MAX_VALUE;
         writeInt(maxDynamicTableByteCount, PREFIX_5_BITS, 0x20);
       }
-      // TODO: implement index tracking
+
       for (int i = 0, size = headerBlock.size(); i < size; i++) {
         Header header = headerBlock.get(i);
+        int headerIndex = getHeaderIndex(header);
+        if (headerIndex != -1) {
+          // Indexed Header Field.
+          writeInt(headerIndex, PREFIX_7_BITS, 0x80);
+          continue;
+        }
+
         ByteString name = header.name.toAsciiLowercase();
         ByteString value = header.value;
-        Integer staticIndex = NAME_TO_FIRST_INDEX.get(name);
-        if (staticIndex != null) {
-          // Literal Header Field without Indexing - Indexed Name.
-          writeInt(staticIndex + 1, PREFIX_4_BITS, 0);
+        int headerNameIndex = getHeaderNameIndex(name);
+        if (headerNameIndex == -1) {
+          // Literal Header Field with Incremental Indexing - New Name.
+          out.writeByte(0x40);
+          writeByteString(name);
+          writeByteString(value);
+          insertIntoDynamicTable(header);
+          continue;
+        }
+
+        if (name.startsWith(Header.PSEUDO_PREFIX) && !Header.TARGET_AUTHORITY.equals(name)) {
+          // Follow Chromes lead - only include the :authority pseudo header, but exclude all other
+          // pseudo headers. Literal Header Field without Indexing - Indexed Name.
+          writeInt(headerNameIndex, PREFIX_4_BITS, 0);
           writeByteString(value);
         } else {
-          int dynamicIndex = Util.indexOf(dynamicTable, header);
-          if (dynamicIndex != -1) {
-            // Indexed Header.
-            writeInt(dynamicIndex - nextHeaderIndex + STATIC_HEADER_TABLE.length, PREFIX_7_BITS,
-                0x80);
-          } else {
-            // Literal Header Field with Incremental Indexing - New Name
-            out.writeByte(0x40);
-            writeByteString(name);
-            writeByteString(value);
-            insertIntoDynamicTable(header);
-          }
+          // Literal Header Field with Incremental Indexing - Indexed Name.
+          writeInt(headerNameIndex, PREFIX_6_BITS, 0x40);
+          writeByteString(value);
+          insertIntoDynamicTable(header);
         }
       }
     }
@@ -509,6 +519,37 @@ final class Hpack {
         value >>>= 7;
       }
       out.writeByte(value);
+    }
+
+    int getHeaderIndex(Header header) {
+      int dynamicHeaderIndex = Util.indexOf(dynamicTable, header);
+      if (dynamicHeaderIndex != -1) return normalizeDynamicTableIndex(dynamicHeaderIndex);
+
+      // Only search a subset of the static header table. Most entries have an empty value, so it's
+      // unnecessary to waste cycles looking at them.
+      for (int i = 1; i < 7; i++) {
+        if (equal(STATIC_HEADER_TABLE[i], header)) return i + 1;
+      }
+
+      return -1;
+    }
+
+    /** Converts a raw array index in the dynamic table array into the HPACK index address space. */
+    int normalizeDynamicTableIndex(int arrayIndex) {
+      return arrayIndex - nextHeaderIndex + STATIC_HEADER_TABLE.length;
+    }
+
+    int getHeaderNameIndex(ByteString name) {
+      Integer staticIndex = NAME_TO_FIRST_INDEX.get(name);
+      if (staticIndex != null) return staticIndex + 1;
+
+      for (int i = 0, size = dynamicTable.length; i < size; i++) {
+        if (dynamicTable[i] != null && equal(dynamicTable[i].name, name)) {
+          return normalizeDynamicTableIndex(i);
+        }
+      }
+
+      return -1;
     }
 
     void writeByteString(ByteString data) throws IOException {
