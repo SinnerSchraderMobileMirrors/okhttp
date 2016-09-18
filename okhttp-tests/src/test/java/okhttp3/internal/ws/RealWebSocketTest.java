@@ -21,7 +21,10 @@ import java.net.ProtocolException;
 import java.util.Random;
 import java.util.concurrent.Executor;
 import okhttp3.MediaType;
+import okhttp3.Protocol;
+import okhttp3.Request;
 import okhttp3.RequestBody;
+import okhttp3.Response;
 import okio.Buffer;
 import okio.BufferedSink;
 import okio.BufferedSource;
@@ -34,7 +37,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import static okhttp3.WebSocket.BINARY;
 import static okhttp3.WebSocket.TEXT;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -52,34 +54,39 @@ public final class RealWebSocketTest {
   private boolean clientConnectionCloseThrows;
   private boolean clientConnectionClosed;
   private final MemorySocket client2Server = new MemorySocket();
-  private final WebSocketRecorder clientListener = new WebSocketRecorder();
+  private final WebSocketRecorder clientListener = new WebSocketRecorder("client");
 
   private final Executor serverExecutor = new SynchronousExecutor();
   private RealWebSocket server;
   private boolean serverConnectionClosed;
   private final MemorySocket server2client = new MemorySocket();
-  private final WebSocketRecorder serverListener = new WebSocketRecorder();
+  private final WebSocketRecorder serverListener = new WebSocketRecorder("server");
 
   @Before public void setUp() {
     Random random = new Random(0);
     String url = "http://example.com/websocket";
+    Response response = new Response.Builder()
+        .code(101)
+        .request(new Request.Builder().url(url).build())
+        .protocol(Protocol.HTTP_1_1)
+        .build();
 
     client = new RealWebSocket(true, server2client.source(), client2Server.sink(), random,
-        clientExecutor, clientListener, url) {
-      @Override protected void close() throws IOException {
+        clientExecutor, clientListener, response, url) {
+      @Override protected void shutdown() {
         if (clientConnectionClosed) {
           throw new AssertionError("Already closed");
         }
         clientConnectionClosed = true;
 
         if (clientConnectionCloseThrows) {
-          throw new IOException("Oops!");
+          throw new RuntimeException("Oops!");
         }
       }
     };
     server = new RealWebSocket(false, client2Server.source(), server2client.sink(), random,
-        serverExecutor, serverListener, url) {
-      @Override protected void close() throws IOException {
+        serverExecutor, serverListener, response, url) {
+      @Override protected void shutdown() {
         if (serverConnectionClosed) {
           throw new AssertionError("Already closed");
         }
@@ -91,48 +98,6 @@ public final class RealWebSocketTest {
   @After public void tearDown() {
     clientListener.assertExhausted();
     serverListener.assertExhausted();
-  }
-
-  @Test public void nullMessageThrows() throws IOException {
-    try {
-      client.sendMessage(null);
-      fail();
-    } catch (NullPointerException e) {
-      assertEquals("message == null", e.getMessage());
-    }
-  }
-
-  @Test public void textMessage() throws IOException {
-    client.sendMessage(RequestBody.create(TEXT, "Hello!"));
-    server.readMessage();
-    serverListener.assertTextMessage("Hello!");
-  }
-
-  @Test public void binaryMessage() throws IOException {
-    client.sendMessage(RequestBody.create(BINARY, "Hello!"));
-    server.readMessage();
-    serverListener.assertBinaryMessage(new byte[] {'H', 'e', 'l', 'l', 'o', '!'});
-  }
-
-  @Test public void missingContentTypeThrows() throws IOException {
-    try {
-      client.sendMessage(RequestBody.create(null, "Hey!"));
-      fail();
-    } catch (IllegalArgumentException e) {
-      assertEquals("Message content type was null. Must use WebSocket.TEXT or WebSocket.BINARY.",
-          e.getMessage());
-    }
-  }
-
-  @Test public void unknownContentTypeThrows() throws IOException {
-    try {
-      client.sendMessage(RequestBody.create(MediaType.parse("text/plain"), "Hey!"));
-      fail();
-    } catch (IllegalArgumentException e) {
-      assertEquals(
-          "Unknown message content type: text/plain. Must use WebSocket.TEXT or WebSocket.BINARY.",
-          e.getMessage());
-    }
   }
 
   @Test public void streamingMessage() throws IOException {
@@ -152,7 +117,7 @@ public final class RealWebSocketTest {
     serverListener.assertTextMessage("Hello!");
   }
 
-  @Test public void streamingMessageCanInterleavePing() throws IOException, InterruptedException {
+  @Test public void streamingMessageCanInterleavePing() throws IOException {
     RequestBody message = new RequestBody() {
       @Override public MediaType contentType() {
         return TEXT;
@@ -173,7 +138,7 @@ public final class RealWebSocketTest {
     clientListener.assertPong(new Buffer().writeUtf8("Pong?"));
   }
 
-  @Test public void pingWritesPong() throws IOException, InterruptedException {
+  @Test public void pingWritesPong() throws IOException {
     client.sendPing(new Buffer().writeUtf8("Hello!"));
     server.readMessage(); // Read the ping, write the pong.
     client.readMessage(); // Read the pong.
@@ -383,7 +348,7 @@ public final class RealWebSocketTest {
     clientListener.assertClose(1000, "Bye!");
   }
 
-  @Test public void protocolErrorBeforeCloseSendsClose() throws IOException {
+  @Test public void protocolErrorBeforeCloseSendsClose() {
     server2client.raw().write(ByteString.decodeHex("0a00")); // Invalid non-final ping frame.
 
     client.readMessage(); // Detects error, send close, close connection.
@@ -392,6 +357,23 @@ public final class RealWebSocketTest {
 
     server.readMessage();
     serverListener.assertClose(1002, "");
+  }
+
+  @Test public void protocolErrorInCloseResponseClosesConnection() throws IOException {
+    client.close(1000, "Hello");
+    assertFalse(clientConnectionClosed); // Not closed until close reply is received.
+
+    // Manually write an invalid masked close frame.
+    server2client.raw().write(ByteString.decodeHex("888760b420bb635c68de0cd84f"));
+
+    client.readMessage(); // Detects error, closes connection immediately since close already sent.
+    assertTrue(clientConnectionClosed);
+    clientListener.assertFailure(ProtocolException.class, "Server-sent frames must not be masked.");
+
+    server.readMessage();
+    serverListener.assertClose(1000, "Hello");
+
+    serverListener.assertExhausted(); // Client should not have sent second close.
   }
 
   @Test public void protocolErrorAfterCloseDoesNotSendClose() throws IOException {
@@ -420,7 +402,7 @@ public final class RealWebSocketTest {
     assertTrue(clientConnectionClosed);
   }
 
-  @Test public void closeMessageAndConnectionCloseThrowingDoesNotMaskOriginal() throws IOException {
+  @Test public void closeMessageAndConnectionCloseThrowingDoesNotMaskOriginal() {
     client2Server.close();
     clientConnectionCloseThrows = true;
 
@@ -468,7 +450,7 @@ public final class RealWebSocketTest {
           return Timeout.NONE;
         }
 
-        @Override public void close() throws IOException {
+        @Override public void close() {
           closed = true;
         }
       });
@@ -481,14 +463,14 @@ public final class RealWebSocketTest {
           buffer.write(source, byteCount);
         }
 
-        @Override public void flush() throws IOException {
+        @Override public void flush() {
         }
 
         @Override public Timeout timeout() {
           return Timeout.NONE;
         }
 
-        @Override public void close() throws IOException {
+        @Override public void close() {
           closed = true;
         }
       });
